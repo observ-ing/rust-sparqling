@@ -28,6 +28,10 @@ use std::time::Duration;
 
 const DEFAULT_USER_AGENT: &str = "sparql-client/0.1 (Rust)";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default base delay for exponential backoff between retries.
+const DEFAULT_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
+/// Cap on a single backoff sleep, so exponential growth can't run away.
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// A single value (RDF term) returned in a SPARQL result binding.
 #[derive(Debug, Clone, Deserialize)]
@@ -172,12 +176,18 @@ struct SparqlResults {
 pub struct SparqlClient {
     client: Client,
     endpoint: String,
+    /// How many times to retry a throttled / timed-out request (0 = never).
+    max_retries: u32,
+    /// Base delay for exponential backoff between retries.
+    retry_base_delay: Duration,
 }
 
 impl SparqlClient {
     /// Create a client for `endpoint` with a default user agent.
     pub fn new(endpoint: impl Into<String>) -> Self {
-        Self::with_user_agent(endpoint, DEFAULT_USER_AGENT)
+        Self::builder(endpoint)
+            .build()
+            .expect("default client builds")
     }
 
     /// Create a client for `endpoint` with a custom user agent.
@@ -186,7 +196,8 @@ impl SparqlClient {
     /// user agent — requests with generic agents may be throttled or blocked.
     ///
     /// Panics if the underlying HTTP client cannot be built; use
-    /// [`try_with_user_agent`](Self::try_with_user_agent) to handle that case.
+    /// [`builder`](Self::builder) with [`try_with_user_agent`](Self::try_with_user_agent)
+    /// or [`SparqlClientBuilder::build`] to handle that case.
     pub fn with_user_agent(endpoint: impl Into<String>, user_agent: &str) -> Self {
         Self::try_with_user_agent(endpoint, user_agent).expect("reqwest client should build")
     }
@@ -197,13 +208,24 @@ impl SparqlClient {
         endpoint: impl Into<String>,
         user_agent: &str,
     ) -> Result<Self, reqwest::Error> {
-        Ok(Self {
-            client: Client::builder()
-                .user_agent(user_agent)
-                .timeout(DEFAULT_TIMEOUT)
-                .build()?,
-            endpoint: endpoint.into(),
-        })
+        Self::builder(endpoint).user_agent(user_agent).build()
+    }
+
+    /// Start configuring a client: user agent, timeout, or a shared
+    /// [`reqwest::Client`]. See [`SparqlClientBuilder`].
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// use sparql_client::SparqlClient;
+    ///
+    /// let client = SparqlClient::builder("https://query.wikidata.org/sparql")
+    ///     .user_agent("my-app/1.0 (you@example.com)")
+    ///     .timeout(Duration::from_secs(30))
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn builder(endpoint: impl Into<String>) -> SparqlClientBuilder {
+        SparqlClientBuilder::new(endpoint)
     }
 
     /// The endpoint URL this client targets.
@@ -251,9 +273,29 @@ impl SparqlClient {
         self.run(query).await?.boolean.ok_or(Error::UnexpectedShape)
     }
 
-    /// Send a query to the endpoint and parse the SPARQL JSON response.
+    /// Send a query to the endpoint, retrying throttled / timed-out attempts
+    /// up to `max_retries` with backoff, then parse the SPARQL JSON response.
     async fn run(&self, query: &str) -> Result<SparqlResponse, Error> {
-        let response = self
+        let mut attempt = 0;
+        loop {
+            match self.attempt(query).await {
+                Attempt::Done(response) => return Ok(response),
+                Attempt::Failed(error) => return Err(error),
+                Attempt::Retry { after, .. } if attempt < self.max_retries => {
+                    // Honor a server-provided Retry-After; otherwise back off exponentially.
+                    let delay = after.unwrap_or_else(|| self.backoff(attempt));
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                }
+                Attempt::Retry { error, .. } => return Err(error),
+            }
+        }
+    }
+
+    /// A single request attempt, classifying the outcome as done, retryable,
+    /// or terminal.
+    async fn attempt(&self, query: &str) -> Attempt {
+        let response = match self
             .client
             .post(&self.endpoint)
             // Send the query in the body so long queries don't hit URL-length limits.
@@ -262,22 +304,163 @@ impl SparqlClient {
             .body(query.to_string())
             .send()
             .await
-            .map_err(Error::Transport)?;
+        {
+            Ok(response) => response,
+            Err(e) => {
+                // Timeouts and connect failures are worth retrying; other
+                // transport errors (e.g. a bad URL) are not.
+                let retryable = e.is_timeout() || e.is_connect();
+                let error = Error::Transport(e);
+                return if retryable {
+                    Attempt::Retry { error, after: None }
+                } else {
+                    Attempt::Failed(error)
+                };
+            }
+        };
 
         let status = response.status();
         if !status.is_success() {
+            // Read Retry-After before consuming the body.
+            let after = retry_after(response.headers());
             // Endpoints report query-timeout / syntax errors in the body — keep a snippet.
             let body = response.text().await.unwrap_or_default();
-            return Err(Error::Status {
+            let error = Error::Status {
                 status,
                 body: truncate(&body, 512),
-            });
+            };
+            let retryable = status == StatusCode::TOO_MANY_REQUESTS
+                || status == StatusCode::SERVICE_UNAVAILABLE;
+            return if retryable {
+                Attempt::Retry { error, after }
+            } else {
+                Attempt::Failed(error)
+            };
         }
 
-        response
-            .json::<SparqlResponse>()
-            .await
-            .map_err(Error::Decode)
+        match response.json::<SparqlResponse>().await {
+            Ok(response) => Attempt::Done(response),
+            Err(e) => Attempt::Failed(Error::Decode(e)),
+        }
+    }
+
+    /// Exponential backoff for retry number `attempt` (0-based), capped at
+    /// [`MAX_BACKOFF`].
+    fn backoff(&self, attempt: u32) -> Duration {
+        let factor = 2u32.saturating_pow(attempt);
+        self.retry_base_delay
+            .saturating_mul(factor)
+            .min(MAX_BACKOFF)
+    }
+}
+
+/// Outcome of a single request attempt.
+enum Attempt {
+    /// A successfully parsed response.
+    Done(SparqlResponse),
+    /// A terminal error — do not retry.
+    Failed(Error),
+    /// A transient error. `after` carries a server-provided Retry-After delay
+    /// when present.
+    Retry {
+        error: Error,
+        after: Option<Duration>,
+    },
+}
+
+/// Parse a `Retry-After` header expressed as a whole number of seconds.
+///
+/// The HTTP-date form is also valid per RFC 9110 but rare for SPARQL
+/// endpoints; we fall back to exponential backoff when it can't be parsed.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let seconds: u64 = headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(seconds))
+}
+
+/// Builder for [`SparqlClient`]. Created via [`SparqlClient::builder`].
+pub struct SparqlClientBuilder {
+    endpoint: String,
+    user_agent: String,
+    timeout: Duration,
+    max_retries: u32,
+    retry_base_delay: Duration,
+    /// A caller-supplied client to reuse instead of building a fresh one.
+    client: Option<Client>,
+}
+
+impl SparqlClientBuilder {
+    fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            user_agent: DEFAULT_USER_AGENT.to_string(),
+            timeout: DEFAULT_TIMEOUT,
+            max_retries: 0,
+            retry_base_delay: DEFAULT_RETRY_BASE_DELAY,
+            client: None,
+        }
+    }
+
+    /// Set the `User-Agent` header. Ignored when [`http_client`](Self::http_client)
+    /// supplies a pre-built client.
+    pub fn user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = user_agent.into();
+        self
+    }
+
+    /// Set the per-request timeout (default 60s). Ignored when
+    /// [`http_client`](Self::http_client) supplies a pre-built client.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Reuse an existing [`reqwest::Client`] — e.g. to share a connection pool
+    /// across services. When set, `user_agent` and `timeout` are the caller's
+    /// responsibility and the builder's own settings are not applied.
+    pub fn http_client(mut self, client: Client) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    /// Retry throttled (HTTP 429 / 503) and timed-out requests up to `max`
+    /// times before giving up. Default `0` (no retries).
+    ///
+    /// Retries honor a `Retry-After` response header when present, and
+    /// otherwise back off exponentially from
+    /// [`retry_base_delay`](Self::retry_base_delay).
+    pub fn max_retries(mut self, max: u32) -> Self {
+        self.max_retries = max;
+        self
+    }
+
+    /// Base delay for exponential backoff between retries (default 500ms).
+    /// The delay doubles each attempt, capped at 30s.
+    pub fn retry_base_delay(mut self, delay: Duration) -> Self {
+        self.retry_base_delay = delay;
+        self
+    }
+
+    /// Build the [`SparqlClient`], surfacing any HTTP-client build error.
+    pub fn build(self) -> Result<SparqlClient, reqwest::Error> {
+        let client = match self.client {
+            Some(client) => client,
+            None => Client::builder()
+                .user_agent(&self.user_agent)
+                .timeout(self.timeout)
+                .build()?,
+        };
+        Ok(SparqlClient {
+            client,
+            endpoint: self.endpoint,
+            max_retries: self.max_retries,
+            retry_base_delay: self.retry_base_delay,
+        })
     }
 }
 
@@ -473,6 +656,57 @@ mod tests {
                 label: None, // unbound optional variable
             }
         );
+    }
+
+    #[test]
+    fn test_builder_configures_endpoint() {
+        let client = SparqlClient::builder("https://example.com/sparql")
+            .user_agent("test-agent/1.0")
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        assert_eq!(client.endpoint(), "https://example.com/sparql");
+    }
+
+    #[test]
+    fn test_builder_accepts_shared_client() {
+        let http = Client::builder().build().unwrap();
+        let client = SparqlClient::builder("https://example.com/sparql")
+            .http_client(http)
+            .build()
+            .unwrap();
+        assert_eq!(client.endpoint(), "https://example.com/sparql");
+    }
+
+    #[test]
+    fn test_backoff_is_exponential_and_capped() {
+        let client = SparqlClient::builder("https://example.com/sparql")
+            .retry_base_delay(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        assert_eq!(client.backoff(0), Duration::from_secs(1));
+        assert_eq!(client.backoff(1), Duration::from_secs(2));
+        assert_eq!(client.backoff(2), Duration::from_secs(4));
+        // Capped at MAX_BACKOFF rather than growing without bound.
+        assert_eq!(client.backoff(20), MAX_BACKOFF);
+    }
+
+    #[test]
+    fn test_retry_after_parses_seconds() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+        let mut headers = HeaderMap::new();
+        assert_eq!(retry_after(&headers), None);
+
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("12"));
+        assert_eq!(retry_after(&headers), Some(Duration::from_secs(12)));
+
+        // HTTP-date form is unsupported; fall back to None (→ exponential backoff).
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2025 07:28:00 GMT"),
+        );
+        assert_eq!(retry_after(&headers), None);
     }
 
     #[test]
