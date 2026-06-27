@@ -8,7 +8,7 @@ a local [Oxigraph](https://github.com/oxigraph/oxigraph), or any other endpoint.
 
 ```toml
 [dependencies]
-sparql-client = { git = "https://github.com/observ-ing/sparql-client" }
+sparql-http-client = "0.1"
 ```
 
 ```rust
