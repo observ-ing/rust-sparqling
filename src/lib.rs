@@ -177,7 +177,7 @@ pub struct SparqlClient {
 impl SparqlClient {
     /// Create a client for `endpoint` with a default user agent.
     pub fn new(endpoint: impl Into<String>) -> Self {
-        Self::with_user_agent(endpoint, DEFAULT_USER_AGENT)
+        Self::builder(endpoint).build().expect("default client builds")
     }
 
     /// Create a client for `endpoint` with a custom user agent.
@@ -186,7 +186,8 @@ impl SparqlClient {
     /// user agent — requests with generic agents may be throttled or blocked.
     ///
     /// Panics if the underlying HTTP client cannot be built; use
-    /// [`try_with_user_agent`](Self::try_with_user_agent) to handle that case.
+    /// [`builder`](Self::builder) with [`try_with_user_agent`](Self::try_with_user_agent)
+    /// or [`SparqlClientBuilder::build`] to handle that case.
     pub fn with_user_agent(endpoint: impl Into<String>, user_agent: &str) -> Self {
         Self::try_with_user_agent(endpoint, user_agent).expect("reqwest client should build")
     }
@@ -197,13 +198,24 @@ impl SparqlClient {
         endpoint: impl Into<String>,
         user_agent: &str,
     ) -> Result<Self, reqwest::Error> {
-        Ok(Self {
-            client: Client::builder()
-                .user_agent(user_agent)
-                .timeout(DEFAULT_TIMEOUT)
-                .build()?,
-            endpoint: endpoint.into(),
-        })
+        Self::builder(endpoint).user_agent(user_agent).build()
+    }
+
+    /// Start configuring a client: user agent, timeout, or a shared
+    /// [`reqwest::Client`]. See [`SparqlClientBuilder`].
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// use sparql_client::SparqlClient;
+    ///
+    /// let client = SparqlClient::builder("https://query.wikidata.org/sparql")
+    ///     .user_agent("my-app/1.0 (you@example.com)")
+    ///     .timeout(Duration::from_secs(30))
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn builder(endpoint: impl Into<String>) -> SparqlClientBuilder {
+        SparqlClientBuilder::new(endpoint)
     }
 
     /// The endpoint URL this client targets.
@@ -278,6 +290,63 @@ impl SparqlClient {
             .json::<SparqlResponse>()
             .await
             .map_err(Error::Decode)
+    }
+}
+
+/// Builder for [`SparqlClient`]. Created via [`SparqlClient::builder`].
+pub struct SparqlClientBuilder {
+    endpoint: String,
+    user_agent: String,
+    timeout: Duration,
+    /// A caller-supplied client to reuse instead of building a fresh one.
+    client: Option<Client>,
+}
+
+impl SparqlClientBuilder {
+    fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            user_agent: DEFAULT_USER_AGENT.to_string(),
+            timeout: DEFAULT_TIMEOUT,
+            client: None,
+        }
+    }
+
+    /// Set the `User-Agent` header. Ignored when [`http_client`](Self::http_client)
+    /// supplies a pre-built client.
+    pub fn user_agent(mut self, user_agent: impl Into<String>) -> Self {
+        self.user_agent = user_agent.into();
+        self
+    }
+
+    /// Set the per-request timeout (default 60s). Ignored when
+    /// [`http_client`](Self::http_client) supplies a pre-built client.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Reuse an existing [`reqwest::Client`] — e.g. to share a connection pool
+    /// across services. When set, `user_agent` and `timeout` are the caller's
+    /// responsibility and the builder's own settings are not applied.
+    pub fn http_client(mut self, client: Client) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    /// Build the [`SparqlClient`], surfacing any HTTP-client build error.
+    pub fn build(self) -> Result<SparqlClient, reqwest::Error> {
+        let client = match self.client {
+            Some(client) => client,
+            None => Client::builder()
+                .user_agent(&self.user_agent)
+                .timeout(self.timeout)
+                .build()?,
+        };
+        Ok(SparqlClient {
+            client,
+            endpoint: self.endpoint,
+        })
     }
 }
 
@@ -473,6 +542,26 @@ mod tests {
                 label: None, // unbound optional variable
             }
         );
+    }
+
+    #[test]
+    fn test_builder_configures_endpoint() {
+        let client = SparqlClient::builder("https://example.com/sparql")
+            .user_agent("test-agent/1.0")
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        assert_eq!(client.endpoint(), "https://example.com/sparql");
+    }
+
+    #[test]
+    fn test_builder_accepts_shared_client() {
+        let http = Client::builder().build().unwrap();
+        let client = SparqlClient::builder("https://example.com/sparql")
+            .http_client(http)
+            .build()
+            .unwrap();
+        assert_eq!(client.endpoint(), "https://example.com/sparql");
     }
 
     #[test]
