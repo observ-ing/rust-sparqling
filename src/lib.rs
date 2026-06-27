@@ -185,7 +185,9 @@ pub struct SparqlClient {
 impl SparqlClient {
     /// Create a client for `endpoint` with a default user agent.
     pub fn new(endpoint: impl Into<String>) -> Self {
-        Self::builder(endpoint).build().expect("default client builds")
+        Self::builder(endpoint)
+            .build()
+            .expect("default client builds")
     }
 
     /// Create a client for `endpoint` with a custom user agent.
@@ -360,7 +362,10 @@ enum Attempt {
     Failed(Error),
     /// A transient error. `after` carries a server-provided Retry-After delay
     /// when present.
-    Retry { error: Error, after: Option<Duration> },
+    Retry {
+        error: Error,
+        after: Option<Duration>,
+    },
 }
 
 /// Parse a `Retry-After` header expressed as a whole number of seconds.
