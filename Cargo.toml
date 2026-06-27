@@ -1,5 +1,5 @@
 [package]
-name = "sparql-client"
+name = "sparql-http-client"
 version = "0.1.0"
 edition = "2021"
 description = "Minimal async SPARQL-over-HTTP client"
@@ -8,6 +8,10 @@ repository = "https://github.com/observ-ing/sparql-client"
 readme = "README.md"
 keywords = ["sparql", "rdf", "wikidata", "http", "client"]
 categories = ["api-bindings", "web-programming::http-client"]
+
+[lib]
+# Keep the import path `sparql_client` independent of the published package name.
+name = "sparql_client"
 
 [dependencies]
 # HTTP client
