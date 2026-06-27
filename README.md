@@ -44,6 +44,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - Queries are sent in the request body, so long queries don't hit URL-length limits.
 - A custom user agent can be set with [`SparqlClient::with_user_agent`] — many
   public endpoints (Wikidata in particular) require a meaningful user agent.
+- **Typed rows** via [`SparqlClient::query_into`] — deserialize each binding
+  straight into your own struct, with `xsd:` datatypes coerced to numbers /
+  booleans.
+- **Typed accessors** on [`SparqlValue`] (`as_i64`, `as_f64`, `as_bool`,
+  `is_uri`, and `as_datetime` behind the `chrono` feature).
+- **Configurable construction** via [`SparqlClient::builder`] — user agent,
+  timeout, a shared `reqwest::Client`, and automatic retries.
+- **Built-in retry** with exponential backoff that honors the server's
+  `Retry-After` header (opt in with `.max_retries(n)`).
 - [`escape_literal`] for safely embedding strings in double-quoted SPARQL literals.
 - Rich [`Error`] type with [`Error::is_throttled`] (HTTP 429 / 503) and
   [`Error::is_timeout`] helpers for retry logic.
