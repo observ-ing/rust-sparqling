@@ -21,6 +21,7 @@
 
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use reqwest::{Client, StatusCode};
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -98,6 +99,60 @@ impl SparqlValue {
 /// A row of results from a SPARQL query, mapping variable names to values.
 pub type SparqlBinding = HashMap<String, SparqlValue>;
 
+/// Deserialize a single result row into `T`.
+///
+/// Each term is coerced to a JSON scalar based on its `xsd:` datatype
+/// (integers → numbers, `xsd:boolean` → bool, decimals/doubles → floats),
+/// then handed to `T`'s `Deserialize` impl. IRIs and untyped literals stay
+/// strings. This is the per-row primitive behind
+/// [`SparqlClient::query_into`].
+pub fn from_binding<T: DeserializeOwned>(binding: &SparqlBinding) -> Result<T, Error> {
+    let map: serde_json::Map<String, serde_json::Value> = binding
+        .iter()
+        .map(|(var, value)| (var.clone(), value_to_json(value)))
+        .collect();
+    serde_json::from_value(serde_json::Value::Object(map)).map_err(Error::Deserialize)
+}
+
+/// Coerce a SPARQL term to a JSON scalar using its datatype IRI, so serde can
+/// deserialize numeric / boolean columns without the caller writing custom
+/// `deserialize_with` adapters. Anything unrecognized stays a string.
+fn value_to_json(value: &SparqlValue) -> serde_json::Value {
+    use serde_json::Value as Json;
+
+    // IRIs and blank nodes are always strings.
+    if value.value_type.as_deref() != Some("literal")
+        && value.value_type.as_deref() != Some("typed-literal")
+    {
+        return Json::String(value.value.clone());
+    }
+
+    let as_string = || Json::String(value.value.clone());
+    let trimmed = value.value.trim();
+    match value.datatype_name() {
+        Some(
+            "integer" | "int" | "long" | "short" | "byte" | "nonNegativeInteger"
+            | "positiveInteger" | "negativeInteger" | "nonPositiveInteger" | "unsignedInt"
+            | "unsignedLong" | "unsignedShort" | "unsignedByte",
+        ) => trimmed
+            .parse::<i64>()
+            .map(|n| Json::Number(n.into()))
+            .unwrap_or_else(|_| as_string()),
+        Some("decimal" | "double" | "float") => trimmed
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(Json::Number)
+            .unwrap_or_else(as_string),
+        Some("boolean") => match trimmed {
+            "true" | "1" => Json::Bool(true),
+            "false" | "0" => Json::Bool(false),
+            _ => as_string(),
+        },
+        _ => as_string(),
+    }
+}
+
 /// Full SPARQL JSON results — handles SELECT (`results.bindings`) and ASK (`boolean`).
 #[derive(Debug, Default, Deserialize)]
 struct SparqlResponse {
@@ -159,6 +214,36 @@ impl SparqlClient {
     /// Execute a SELECT-style SPARQL query and return the result bindings.
     pub async fn sparql_query(&self, query: &str) -> Result<Vec<SparqlBinding>, Error> {
         Ok(self.run(query).await?.results.bindings)
+    }
+
+    /// Execute a SELECT-style query and deserialize each row into `T`.
+    ///
+    /// Variable names map to struct fields; literal terms are coerced to
+    /// numbers / booleans according to their `xsd:` datatype, and everything
+    /// else (IRIs, plain literals) maps to a `String`. Unbound optional
+    /// variables map cleanly to `Option<T>` fields.
+    ///
+    /// ```no_run
+    /// # use serde::Deserialize;
+    /// # use sparql_client::SparqlClient;
+    /// #[derive(Deserialize)]
+    /// struct Person {
+    ///     item: String,
+    ///     count: i64,
+    /// }
+    ///
+    /// # async fn example() -> Result<(), sparql_client::Error> {
+    /// let client = SparqlClient::new("https://query.wikidata.org/sparql");
+    /// let people: Vec<Person> = client.query_into("SELECT ?item ?count WHERE { … }").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn query_into<T: DeserializeOwned>(&self, query: &str) -> Result<Vec<T>, Error> {
+        self.sparql_query(query)
+            .await?
+            .iter()
+            .map(from_binding)
+            .collect()
     }
 
     /// Execute an `ASK { … }` query.
@@ -244,6 +329,9 @@ pub enum Error {
     Status { status: StatusCode, body: String },
     /// The response could not be decoded as SPARQL JSON.
     Decode(reqwest::Error),
+    /// A result row could not be deserialized into the requested type (see
+    /// [`SparqlClient::query_into`]).
+    Deserialize(serde_json::Error),
     /// The response was valid JSON but not the expected shape (e.g. an ASK
     /// query returned no `boolean`).
     UnexpectedShape,
@@ -269,6 +357,7 @@ impl std::fmt::Display for Error {
             Error::Transport(e) => write!(f, "SPARQL request error: {e}"),
             Error::Status { status, body } => write!(f, "SPARQL HTTP error: {status}: {body}"),
             Error::Decode(e) => write!(f, "SPARQL response decode error: {e}"),
+            Error::Deserialize(e) => write!(f, "SPARQL row deserialize error: {e}"),
             Error::UnexpectedShape => write!(f, "SPARQL response had an unexpected shape"),
         }
     }
@@ -278,6 +367,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::Transport(e) | Error::Decode(e) => Some(e),
+            Error::Deserialize(e) => Some(e),
             Error::Status { .. } | Error::UnexpectedShape => None,
         }
     }
@@ -353,5 +443,52 @@ mod tests {
         let dt = v.as_datetime().unwrap();
         assert_eq!(dt.to_rfc3339(), "2024-01-02T03:04:05+00:00");
         assert!(uri("http://example.com/x").as_datetime().is_none());
+    }
+
+    #[test]
+    fn test_from_binding_coerces_types() {
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        struct Row {
+            item: String,
+            count: i64,
+            ratio: f64,
+            active: bool,
+            label: Option<String>,
+        }
+
+        let mut binding = SparqlBinding::new();
+        binding.insert("item".into(), uri("http://example.com/x"));
+        binding.insert("count".into(), typed("42", "integer"));
+        binding.insert("ratio".into(), typed("3.5", "decimal"));
+        binding.insert("active".into(), typed("true", "boolean"));
+
+        let row: Row = from_binding(&binding).unwrap();
+        assert_eq!(
+            row,
+            Row {
+                item: "http://example.com/x".into(),
+                count: 42,
+                ratio: 3.5,
+                active: true,
+                label: None, // unbound optional variable
+            }
+        );
+    }
+
+    #[test]
+    fn test_from_binding_reports_type_mismatch() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Row {
+            #[allow(dead_code)]
+            count: i64,
+        }
+
+        let mut binding = SparqlBinding::new();
+        // A non-numeric value where i64 is expected surfaces as Error::Deserialize.
+        binding.insert("count".into(), typed("not-a-number", "string"));
+        assert!(matches!(
+            from_binding::<Row>(&binding),
+            Err(Error::Deserialize(_))
+        ));
     }
 }
