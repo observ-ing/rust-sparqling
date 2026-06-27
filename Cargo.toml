@@ -15,3 +15,10 @@ reqwest = { version = "0.13", features = ["json"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
+
+# Optional: parse xsd:dateTime literals via SparqlValue::as_datetime
+chrono = { version = "0.4", default-features = false, features = ["std"], optional = true }
+
+[features]
+# Enable SparqlValue::as_datetime, which parses RFC 3339 / xsd:dateTime values.
+chrono = ["dep:chrono"]

@@ -41,6 +41,60 @@ pub struct SparqlValue {
     pub lang: Option<String>,
 }
 
+impl SparqlValue {
+    /// True if this term is an IRI (`type` is `"uri"`).
+    pub fn is_uri(&self) -> bool {
+        self.value_type.as_deref() == Some("uri")
+    }
+
+    /// True if this term is a literal — plain, language-tagged, or typed.
+    pub fn is_literal(&self) -> bool {
+        matches!(
+            self.value_type.as_deref(),
+            Some("literal") | Some("typed-literal")
+        )
+    }
+
+    /// True if this term is a blank node (`type` is `"bnode"`).
+    pub fn is_bnode(&self) -> bool {
+        self.value_type.as_deref() == Some("bnode")
+    }
+
+    /// The local datatype name, e.g. `"integer"` for
+    /// `http://www.w3.org/2001/XMLSchema#integer`. `None` for non-typed terms.
+    pub fn datatype_name(&self) -> Option<&str> {
+        let dt = self.datatype.as_deref()?;
+        Some(dt.rsplit(['#', '/']).next().unwrap_or(dt))
+    }
+
+    /// Parse the value as an `i64` (`xsd:integer` and friends).
+    pub fn as_i64(&self) -> Option<i64> {
+        self.value.trim().parse().ok()
+    }
+
+    /// Parse the value as an `f64` (`xsd:decimal`, `xsd:double`, `xsd:float`).
+    pub fn as_f64(&self) -> Option<f64> {
+        self.value.trim().parse().ok()
+    }
+
+    /// Parse the value as an `xsd:boolean` — accepts `true`/`false` and `1`/`0`.
+    pub fn as_bool(&self) -> Option<bool> {
+        match self.value.trim() {
+            "true" | "1" => Some(true),
+            "false" | "0" => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Parse the value as an RFC 3339 / `xsd:dateTime` timestamp.
+    ///
+    /// Requires the `chrono` feature.
+    #[cfg(feature = "chrono")]
+    pub fn as_datetime(&self) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+        chrono::DateTime::parse_from_rfc3339(self.value.trim()).ok()
+    }
+}
+
 /// A row of results from a SPARQL query, mapping variable names to values.
 pub type SparqlBinding = HashMap<String, SparqlValue>;
 
@@ -247,5 +301,57 @@ mod tests {
         assert_eq!(truncate("abcdef", 3), "abc…");
         // Does not split a multi-byte char.
         assert_eq!(truncate("aé", 2), "a…");
+    }
+
+    fn typed(value: &str, datatype: &str) -> SparqlValue {
+        SparqlValue {
+            value_type: Some("typed-literal".into()),
+            value: value.into(),
+            datatype: Some(format!("http://www.w3.org/2001/XMLSchema#{datatype}")),
+            lang: None,
+        }
+    }
+
+    fn uri(value: &str) -> SparqlValue {
+        SparqlValue {
+            value_type: Some("uri".into()),
+            value: value.into(),
+            datatype: None,
+            lang: None,
+        }
+    }
+
+    #[test]
+    fn test_term_kind() {
+        let u = uri("http://example.com/x");
+        assert!(u.is_uri() && !u.is_literal() && !u.is_bnode());
+        let l = typed("1", "integer");
+        assert!(l.is_literal() && !l.is_uri());
+    }
+
+    #[test]
+    fn test_value_parsing() {
+        assert_eq!(typed("42", "integer").as_i64(), Some(42));
+        assert_eq!(typed(" 42 ", "integer").as_i64(), Some(42));
+        assert_eq!(typed("3.5", "decimal").as_f64(), Some(3.5));
+        assert_eq!(typed("true", "boolean").as_bool(), Some(true));
+        assert_eq!(typed("0", "boolean").as_bool(), Some(false));
+        assert_eq!(typed("nope", "boolean").as_bool(), None);
+        assert_eq!(typed("x", "integer").as_i64(), None);
+    }
+
+    #[test]
+    fn test_datatype_name() {
+        assert_eq!(typed("1", "integer").datatype_name(), Some("integer"));
+        assert_eq!(uri("http://example.com/x").datatype_name(), None);
+    }
+
+    #[cfg(feature = "chrono")]
+    #[test]
+    fn test_as_datetime() {
+        let v = typed("2024-01-02T03:04:05Z", "dateTime");
+        let dt = v.as_datetime().unwrap();
+        assert_eq!(dt.to_rfc3339(), "2024-01-02T03:04:05+00:00");
+        assert!(uri("http://example.com/x").as_datetime().is_none());
     }
 }
