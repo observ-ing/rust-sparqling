@@ -1,4 +1,4 @@
-# sparql-client
+# sparqling
 
 Minimal async [SPARQL](https://www.w3.org/TR/sparql11-query/)-over-HTTP client for Rust.
 
