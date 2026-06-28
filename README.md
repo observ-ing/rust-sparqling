@@ -8,8 +8,10 @@ a local [Oxigraph](https://github.com/oxigraph/oxigraph), or any other endpoint.
 
 ```toml
 [dependencies]
-sparql-http-client = "0.1"
+sparqling = "0.1"
 ```
+
+The crate is published as `sparqling`; the import path is `sparql_client`:
 
 ```rust
 use sparql_client::SparqlClient;
